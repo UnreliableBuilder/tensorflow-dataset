@@ -1,0 +1,12 @@
+// Definitions for metadata related to whole datasets and its instances and
+// splits.
+
+syntax = "proto3";
+
+package tensorflow_datasets;
+
+option cc_enable_arenas = true;
+
+message IndexInfo {
+  repeated string record_positions = 1;
+}

@@ -20,7 +20,7 @@ import itertools
 import json
 import os
 
-from typing import Any, Iterable, List, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 from absl import logging
 import six
@@ -33,8 +33,11 @@ from tensorflow_datasets.core import hashing
 from tensorflow_datasets.core import lazy_imports_lib
 from tensorflow_datasets.core import shuffle
 from tensorflow_datasets.core import utils
+from tensorflow_datasets.core.proto import index_info_pb2
 from tensorflow_datasets.core.utils import shard_utils
 from tensorflow_datasets.core.utils import type_utils
+
+from google.protobuf import json_format
 
 # TODO(tfds): Should be `TreeDict[FeatureValue]`
 Example = Any
@@ -52,17 +55,23 @@ TFRECORD_REC_OVERHEAD = 16
 # It seems reasonable to require 10GB of RAM per worker to handle a 1PB split.
 _BEAM_NUM_TEMP_SHARDS = int(100e3)
 
+_INDEX_PATH_SUFFIX = "_index.json"
+
 # Spec to write a final tfrecord shard.
-_ShardSpec = collections.namedtuple("_ShardSpec", [
-    # Index of shard.
-    "shard_index",
-    # The path where to write shard.
-    "path",
-    # Number of examples in shard
-    "examples_number",
-    # Reading instructions (List[FileInstruction]).
-    "file_instructions",
-])
+_ShardSpec = collections.namedtuple(
+    "_ShardSpec",
+    [
+        # Index of shard.
+        "shard_index",
+        # The path where to write shard.
+        "path",
+        # The path where to write index of the shard.
+        "index_path",
+        # Number of examples in shard
+        "examples_number",
+        # Reading instructions (List[FileInstruction]).
+        "file_instructions",
+    ])
 
 
 def _raise_error_for_duplicated_keys(example1, example2, example_specs):
@@ -75,6 +84,16 @@ def _raise_error_for_duplicated_keys(example1, example2, example_specs):
   logging.error("1st example: %s", ex1)
   logging.error("2nd example: %s", ex2)
   raise AssertionError(msg + " See logs above to view the examples.")
+
+
+def _get_index_path(path: str) -> str:
+  """Returns index path from given path of the records.
+
+  Args:
+    path: Path to the record file.
+  """
+  return os.path.join(os.path.dirname(path),
+                      os.path.basename(path).replace(".", "_"))
 
 
 def _get_shard_specs(
@@ -100,12 +119,16 @@ def _get_shard_specs(
     # Read the bucket indexes
     file_instructions = shard_utils.get_file_instructions(
         from_, to, bucket_indexes, bucket_lengths)
-    shard_specs.append(_ShardSpec(
-        shard_index=shard_index,
-        path="%s-%05d-of-%05d" % (path, shard_index, num_shards),
-        examples_number=to-from_,
-        file_instructions=file_instructions,
-    ))
+    index_path = "%s-%05d-of-%05d" % (_get_index_path(path), shard_index,
+                                      num_shards)
+    shard_specs.append(
+        _ShardSpec(
+            shard_index=shard_index,
+            path="%s-%05d-of-%05d" % (path, shard_index, num_shards),
+            index_path=index_path + _INDEX_PATH_SUFFIX,
+            examples_number=to - from_,
+            file_instructions=file_instructions,
+        ))
     from_ = to
   return shard_specs
 
@@ -128,9 +151,33 @@ def _get_shard_boundaries(
 def _write_examples(
     path: type_utils.PathLike,
     iterator: Iterable[bytes],
-    file_format: file_adapters.FileFormat = file_adapters.DEFAULT_FILE_FORMAT):
+    file_format: file_adapters.FileFormat = file_adapters.DEFAULT_FILE_FORMAT
+) -> Optional[Iterable[Any]]:
   """Write examples from iterator in the given `file_format`."""
-  file_adapters.ADAPTER_FOR_FORMAT[file_format].write_examples(path, iterator)
+  return file_adapters.ADAPTER_FOR_FORMAT[file_format].write_examples(
+      path, iterator)
+
+
+def _write_index_file(sharded_index_path: str, shard_keys: List[Any]):
+  """Writes index file for examples in the shard represented as `shard_spec`.
+
+  Args:
+    sharded_index_path: Path to the sharded index path.
+    shard_keys: List of keys/indices of the examples in the shard represented
+      by given `shard_spec`.
+  """
+  index_info = index_info_pb2.IndexInfo()
+  del index_info.record_positions[:]
+  for key in shard_keys:
+    index_info.record_positions.append(str(key))
+
+  # Convert to dict to write the index file as a JSON file. It will be
+  # easier to retrieve, parse and look up later based on the index.
+  def _as_json(index_info):
+    return json_format.MessageToJson(index_info, sort_keys=True)
+
+  with tf.io.gfile.GFile(sharded_index_path, "w") as json_f:
+    json_f.write(_as_json(index_info=index_info))
 
 
 def _get_number_shards(
@@ -234,7 +281,21 @@ class Writer(object):
       for shard_spec in shard_specs:
         iterator = itertools.islice(
             examples_generator, 0, shard_spec.examples_number)
-        _write_examples(shard_spec.path, iterator, self._file_format)
+        shard_keys = _write_examples(shard_spec.path, iterator,
+                                     self._file_format)
+
+        # No shard keys returned, index cannot be created.
+        if not shard_keys:
+          continue
+
+        # Number of `shard_keys` received should match the number of examples
+        # written in this shard.
+        if len(shard_keys) != int(shard_spec.examples_number):
+          raise RuntimeError(
+              f"Length of example `keys` ({len(shard_keys)}) does not match "
+              f"`shard_spec.examples_number: (`{shard_spec.examples_number})")
+        _write_index_file(shard_spec.index_path, shard_keys)
+
     except shuffle.DuplicatedKeysError as err:
       _raise_error_for_duplicated_keys(
           err.item1, err.item2, self._example_specs
@@ -293,7 +354,7 @@ class BeamWriter(object):
         which the dataset will be read/written from.
     """
     self._original_state = dict(example_specs=example_specs, path=path,
-                                hash_salt=hash_salt)
+                                hash_salt=hash_salt, file_format=file_format)
     self._path = os.fspath(path)
     self._split_info_path = "%s.split_info.json" % path
     self._serializer = example_serializer.ExampleSerializer(example_specs)
@@ -386,7 +447,12 @@ class BeamWriter(object):
     shard_path, examples_by_bucket = shardid_examples
     examples = list(itertools.chain(*[
         ex[1] for ex in sorted(examples_by_bucket)]))
-    _write_examples(shard_path, examples, self._file_format)
+    shard_keys = _write_examples(shard_path, examples, self._file_format)
+    # If there are no shard_keys, skip creating index files.
+    if not shard_keys:
+      return
+    index_path = _get_index_path(shard_path) + _INDEX_PATH_SUFFIX
+    _write_index_file(index_path, list(shard_keys))
 
   def write_from_pcollection(self, examples_pcollection):
     """Returns PTransform to write (key, example) PCollection to tfrecords."""
