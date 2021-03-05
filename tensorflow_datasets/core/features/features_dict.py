@@ -189,11 +189,15 @@ class FeaturesDict(top_level_feature.TopLevelFeature):
 
   def encode_example(self, example_dict):
     """See base class for details."""
-    return {
-        k: feature.encode_example(example_value)
-        for k, (feature, example_value)
-        in utils.zip_dict(self._feature_dict, example_dict)
-    }
+    example = {}
+    for k, (feature, example_value) in utils.zip_dict(self._feature_dict,
+                                                      example_dict):
+      try:
+        example[k] = feature.encode_example(example_value)
+      except Exception as e:
+        raise ValueError("occurred for <{}> feature with name '{}'".format(
+            feature.__class__.__name__, k)) from e
+    return example
 
   def _flatten(self, x):
     """See base class for details."""
